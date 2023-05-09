@@ -3,102 +3,64 @@ using System.Text;
 using Newtonsoft.Json;
 using ServerApp.API.Models;
 using ServerApp.Websocket.Actions;
+using ServerApp.Websocket.Services.Player;
+using ServerApp.Websocket.Services.Sender;
 
 namespace ServerApp.Websocket
 {
     public class GameWebSocketHandler : WebSocketHandler
     {
-        public async override Task Handle(HttpContext context, WebSocket webSocket)
+        private readonly IPlayerService _playerService;
+        private readonly ISender _sender;
+        private readonly IPlayerActions _playerActions;
+        
+        private readonly byte[] _buffer = new  byte[1024 * 4];
+        public GameWebSocketHandler(IPlayerService playerService, ISender sender, IPlayerActions playerActions)
         {
-            var connectionId = GetConnectionId();
+            _playerService = playerService;
+            _sender = sender;
+            _playerActions = playerActions;
+        }
+        public async override Task Handle(WebSocket webSocket)
+        {
+         
             
-            Sockets.TryAdd(connectionId, webSocket);
-            Console.WriteLine("ID " + connectionId + "Socket " + webSocket);;
-
-            var playerId = await GetNextAvailablePlayerId();
+            var playerId = await OnConnected(webSocket);
             
-            Players.TryAdd(connectionId, playerId);
-
-            await OnConnected(context, playerId);
-
-            var buffer = new byte[1024 * 4];
-
             while (webSocket!.State == WebSocketState.Open)
             {
-                var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+                var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(_buffer), CancellationToken.None);
 
-                switch (result.MessageType)
+                if (result.MessageType == WebSocketMessageType.Text)
                 {
-                    case WebSocketMessageType.Text:
-                    {
-                        var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                        await OnMessage(context, message, playerId);
-                        break;
-                    }
-
-                    case WebSocketMessageType.Close:
-                        Players.TryRemove(connectionId, out playerId); 
-                        Sockets.TryRemove(connectionId, out webSocket!);
-                        await CloseConnection(webSocket, playerId);
-                        break;
+                    var message = Encoding.UTF8.GetString(_buffer, 0, result.Count);
+                    await OnMessage(message, playerId);
+                } 
+                else if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    await OnDisconnected(webSocket, playerId);
                 }
             }
         }
         
-        private async Task CloseConnection(WebSocket webSocket, int playerId)
-        {
-            if (webSocket.State == WebSocketState.CloseReceived)
-            {
-                await webSocket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None);
-                await OnDisconnected(playerId);
-            }
-            else if (webSocket.State == WebSocketState.Open)
-            {
-                await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing connection", CancellationToken.None);
-                await OnDisconnected(playerId);
-            }
-        }
+        async protected override Task<int> OnConnected(WebSocket webSocket)
+        { 
+            var playerId = await _playerService.AddPlayerToServer(webSocket);
+           await _playerActions.OnInstantiate(playerId);
 
-        async protected override Task OnConnected(HttpContext context, int playerId)
-        {
-            await InstantiatePlayer.Action(context, playerId);
+           return playerId;
         }
         
-        async protected override Task OnDisconnected(int playerId)
+        async protected override Task OnDisconnected(WebSocket webSocket, int playerId)
         {
-            Console.WriteLine("  PlayerID " + playerId + " Disconnected");
-            Console.WriteLine("Connected Players " + Players.Count);
-            Console.WriteLine("Connected Sockets " + Sockets.Count);
-            await SendAll($"Player {playerId} disconnected");
+            await _playerService.RemovePlayerFromServer(webSocket, playerId);
         }
-        
-        async protected override Task OnMessage(HttpContext context, string message, int playerId)
+        async protected override Task OnMessage(string message, int playerId)
         {
-            try
-            {
-                var data = JsonConvert.DeserializeObject<PlayerPosition>(message);
-                // Console.WriteLine($"ID {data.PlayerId} X {data.PositionX} Y {data.PositionY} Z {data.PositionZ}");
-                var json = JsonConvert.SerializeObject(data);
-                await SendOther(data.PlayerId, json);
-            }
-            catch (Exception e)
-            {
-                //ignored
-            }
+            //ToDo: Need Json Generic Serialize
+            var data = JsonConvert.DeserializeObject<PlayerPosition>(message);
+            var json = JsonConvert.SerializeObject(data);
+            await _sender.SendOther(data.PlayerId, json);
         }
-
-        private Task<int> GetNextAvailablePlayerId()
-        {
-            var playerId = 1;
-            if (Players.Values.Any())
-            {
-                playerId = Players.Values.Max() + 1;
-            }
-            
-            Console.WriteLine($"Player with ID '{playerId}' has been added to the game.");
-            
-            return Task.FromResult(playerId);
-        }
-     
     }
 }
